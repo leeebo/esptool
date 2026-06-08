@@ -20,6 +20,7 @@ CONFIG_OPTIONS = [
     "serial_write_timeout",
     "connect_attempts",
     "write_block_attempts",
+    "lost_response_resends",
     "reset_delay",
     "open_port_attempts",
     "custom_reset_sequence",
