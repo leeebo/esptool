@@ -266,6 +266,17 @@ class NANDEraseFailed(FatalError):
         FatalError.__init__(self, message)
 
 
+class SerialReaderStoppedError(FatalError):
+    """
+    Raised when the SLIP reader stops because the serial stream ended before a
+    response was received (empty read), as opposed to a panic, invalid SLIP
+    framing, or a partially-transferred packet. This narrow type lets callers
+    optionally re-send idempotent requests on flaky transports (e.g.
+    USB-Serial/JTAG links with marginal signal integrity) without swallowing
+    genuine errors. See the ``lost_response_resends`` configuration option.
+    """
+
+
 class UnsupportedCommandError(RuntimeError):
     """
     Wrapper class for when ROM loader returns an invalid command response.
