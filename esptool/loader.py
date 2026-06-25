@@ -111,12 +111,10 @@ DEFAULT_SERIAL_WRITE_TIMEOUT = cfg.getfloat("serial_write_timeout", 10)
 DEFAULT_CONNECT_ATTEMPTS = cfg.getint("connect_attempts", 7)
 # Number of times to try writing a data block
 WRITE_BLOCK_ATTEMPTS = cfg.getint("write_block_attempts", 3)
-# Number of times to re-send an idempotent request whose response is lost on a
-# flaky transport (e.g. USB-Serial/JTAG on boards with marginal USB signal
-# integrity). This fork ships with it ON (15) so it can be sent to users for
-# quick testing without any config; set "lost_response_resends = 0" in an
-# esptool config file to restore stock upstream behavior.
-LOST_RESPONSE_RESENDS = cfg.getint("lost_response_resends", 15)
+# Number of times to re-send a request whose response is lost or whose reply is
+# a spurious "invalid command" on a flaky transport (e.g. USB-Serial/JTAG on
+# boards with marginal USB signal integrity). Disabled (0) by default.
+LOST_RESPONSE_RESENDS = cfg.getint("lost_response_resends", 0)
 # Number of times to try opening the serial port
 DEFAULT_OPEN_PORT_ATTEMPTS = cfg.getint("open_port_attempts", 1)
 
