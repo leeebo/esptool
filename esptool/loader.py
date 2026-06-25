@@ -686,6 +686,44 @@ class ESPLoader:
             val, _ = self.command()
             self.sync_stub_detected &= val == 0
 
+        # The ROM can emit more SYNC replies than the 8 consumed above, and on
+        # slow/buffered transports (e.g. USB-Serial/JTAG) those extras arrive
+        # late and linger in the input buffer. If left there, the next command
+        # reads a stale SYNC reply instead of its own response, putting the whole
+        # session one response behind (a desync that is unrecoverable for
+        # non-idempotent commands). Drain the backlog before any real command.
+        self._drain_sync_backlog()
+
+    def _drain_sync_backlog(self):
+        """Discard any leftover SYNC responses so the next command starts aligned.
+
+        Reads and throws away whatever is still in the input buffer, extending a
+        short idle grace period whenever more data shows up, so late-arriving
+        replies on a buffered link are caught too. Nothing legitimate is expected
+        between a successful sync and the first command, so this only ever drops
+        stale SYNC traffic.
+        """
+        saved_timeout = self._port.timeout
+        self._port.timeout = 0
+        try:
+            # Sample the input buffer over 10 short windows so the per-stage
+            # counts reveal how the leftover SYNC bytes are delivered (one burst
+            # vs. trickling in late) on this transport.
+            total = 0
+            for stage in range(10):
+                time.sleep(0.01)
+                waiting = self._port.inWaiting()
+                data = self._port.read(waiting) if waiting else b""
+                total += len(data)
+                self.trace(
+                    f"drain_sync_backlog stage {stage + 1}/10: "
+                    f"read {len(data)} bytes (total {total})"
+                )
+        finally:
+            self._port.timeout = saved_timeout
+            # Recreate the SLIP reader so it starts on a clean packet boundary.
+            self.flush_input()
+
     def get_usb_vid_pid(self):
         if self.cache["usb_vid"] is not None and self.cache["usb_pid"] is not None:
             return self.cache["usb_vid"], self.cache["usb_pid"]
