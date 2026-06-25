@@ -105,8 +105,6 @@ Complete list of configurable options:
 +------------------------------+-----------------------------------------------------------+----------+
 | write_block_attempts         | Number of times to try writing a data block               | 3        |
 +------------------------------+-----------------------------------------------------------+----------+
-| lost_response_resends        | Re-sends of a lost/corrupted reply on flaky links (0=off) | 0        |
-+------------------------------+-----------------------------------------------------------+----------+
 | reset_delay                  | Time to wait before the boot pin is released after reset  | 0.05 s   |
 +------------------------------+-----------------------------------------------------------+----------+
 | open_port_attempts           | Number of attempts to open the port (0 - infinite)        | 1        |
@@ -122,8 +120,6 @@ Complete list of configurable options:
     ``connect_attempts`` is the number of attempts to connect to the chip after the port is detected. This is useful when the chip does not enter bootloader mode immediately. For example, when :ref:`automatic bootloader mode <automatic-bootloader>` does not work and :ref:`manual bootloader mode <manual-bootloader>` has to be used.
 
     On the other hand, ``open_port_attempts`` is the number of attempts to look for a port to open. When starting the command, the port does not have to be available. This can be useful when the chip is in deep sleep and is connected using USB-Serial/JTAG. In such cases, the port can disappear.
-
-    ``lost_response_resends`` is meant only for extreme cases of an unreliable transport, typically a USB-Serial/JTAG link on a custom board with marginal USB signal integrity, where individual responses are silently dropped on the wire. When set above ``0``, esptool re-sends a small set of *idempotent* requests up to this many times if their response is lost (``SYNC``, ``READ_REG``, ``GET_SECURITY_INFO`` and ``SPI_FLASH_MD5``). Genuine errors (panics, real unsupported commands including the ROM "invalid command" reply, Secure Download Mode restrictions) and non-idempotent commands are never re-sent. Leave it at ``0`` unless you are working around a known-flaky link; the proper fix for such a board is to correct its USB hardware.
 
 Custom Reset Sequences
 ----------------------
