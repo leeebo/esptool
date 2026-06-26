@@ -695,30 +695,50 @@ class ESPLoader:
         self._drain_sync_backlog()
 
     def _drain_sync_backlog(self):
-        """Discard any leftover SYNC responses so the next command starts aligned.
+        """DIAGNOSTIC PROBE (not a fix): test whether a host write ("nudge")
+        flushes the device's stuck USB-Serial/JTAG TX FIFO.
 
-        Reads and throws away whatever is still in the input buffer, extending a
-        short idle grace period whenever more data shows up, so late-arriving
-        replies on a buffered link are caught too. Nothing legitimate is expected
-        between a successful sync and the first command, so this only ever drops
-        stale SYNC traffic.
+        After sync(), a tail of SYNC replies is known to be stuck in the device
+        until the host writes again. This probe first confirms nothing arrives
+        passively, then tries different harmless writes and reports how many
+        bytes each one shakes loose, so we can pick the right flush trigger for
+        the real fix.
         """
         saved_timeout = self._port.timeout
         self._port.timeout = 0
+
+        def snapshot(label):
+            # Give any write-triggered IN transfer time to land, then read all
+            # that is currently buffered and report it.
+            time.sleep(0.02)
+            waiting = self._port.inWaiting()
+            data = self._port.read(waiting) if waiting else b""
+            self.trace(
+                f"PROBE {label}: read {len(data)} bytes"
+                + (f" | {HexFormatter(data)}" if data else "")
+            )
+            return len(data)
+
         try:
-            # Sample the input buffer over 10 short windows so the per-stage
-            # counts reveal how the leftover SYNC bytes are delivered (one burst
-            # vs. trickling in late) on this transport.
-            total = 0
-            for stage in range(10):
-                time.sleep(0.01)
-                waiting = self._port.inWaiting()
-                data = self._port.read(waiting) if waiting else b""
-                total += len(data)
-                self.trace(
-                    f"drain_sync_backlog stage {stage + 1}/10: "
-                    f"read {len(data)} bytes (total {total})"
-                )
+            # 1) Passive baseline: no write at all. If the link is write-gated
+            #    these should all be 0 (the SYNC tail stays stuck).
+            for i in range(3):
+                snapshot(f"passive {i + 1}/3 (no write)")
+
+            # 2) Single 0xC0 (lone SLIP delimiter / empty frame). Protocol-inert
+            #    but still a USB OUT transaction.
+            self.trace("PROBE -> writing single 0xC0 nudge")
+            self._port.write(b"\xc0")
+            snapshot("after single 0xC0")
+            for i in range(2):
+                snapshot(f"trailing-A {i + 1}/2 (no write)")
+
+            # 3) Empty SLIP frame 0xC0 0xC0.
+            self.trace("PROBE -> writing 0xC0 0xC0 (empty frame) nudge")
+            self._port.write(b"\xc0\xc0")
+            snapshot("after 0xC0 0xC0")
+            for i in range(2):
+                snapshot(f"trailing-B {i + 1}/2 (no write)")
         finally:
             self._port.timeout = saved_timeout
             # Recreate the SLIP reader so it starts on a clean packet boundary.
