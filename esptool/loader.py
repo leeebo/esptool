@@ -695,33 +695,53 @@ class ESPLoader:
         self._drain_sync_backlog()
 
     def _drain_sync_backlog(self):
-        """DIAGNOSTIC PROBE v3 (passive-only, safe -- not a fix).
+        """DIAGNOSTIC PROBE v4 (not a fix): is a protocol-inert 0xC0 enough to
+        trigger the device's TX flush?
 
-        v2 injected a real READ_REG to test a flush trigger, but that extra
-        command + raw reads desynced normally-working chips. All writes are
-        removed here: this version only issues real BLOCKING reads (no writes,
-        no injection), so it cannot corrupt the protocol on any chip.
+        Passive waiting is already settled: the 3 s blocking "stream stopped" in
+        the GET_SECURITY_INFO trace shows even a blocking read does not pull the
+        next chunk, i.e. the link is effectively write-gated. The only thing the
+        fix still needs to know is which trigger works -- a lone 0xC0 (an empty
+        SLIP frame that the bootloader discards and never answers) or only a real
+        command frame.
 
-        It still answers the one decisive question left after v1 (whose
-        non-blocking inWaiting reads could report 0 even when data was ready):
-          * stuck SYNC tail returned here => NOT write-gated; v1's "0 bytes" was
-            an inWaiting prefetch artifact and the fix is just to keep reading.
-          * nothing returned across all windows => the data really is not
-            retrievable by a passive blocking read.
+        0xC0 is safe on any chip precisely because it produces no response to
+        leak into the next command (unlike v2's READ_REG injection). This probe
+        first shows the baseline (no write -> nothing), then writes 0xC0 and does
+        a blocking read, repeated a few times to see if each 0xC0 shakes a chunk
+        loose.
         """
         saved_timeout = self._port.timeout
+
+        def blocking_read(timeout):
+            # Real blocking USB IN request: read(1) blocks up to `timeout`, then
+            # grab whatever else arrived with it.
+            self._port.timeout = timeout
+            chunk = self._port.read(1)
+            if chunk:
+                chunk += self._port.read(self._port.inWaiting())
+            return chunk
+
         try:
-            for i in range(5):
-                # Real blocking USB IN request: read(1) blocks up to the
-                # timeout, then grab whatever else arrived with it.
-                self._port.timeout = 0.2
-                chunk = self._port.read(1)
-                if chunk:
-                    chunk += self._port.read(self._port.inWaiting())
+            # Baseline: no write -> expected to confirm the known write-gating.
+            for i in range(2):
+                data = blocking_read(0.2)
                 self.trace(
-                    f"PROBE passive {i + 1}/5 (blocking, no write): "
-                    f"read {len(chunk)} bytes"
-                    + (f" | {HexFormatter(chunk)}" if chunk else "")
+                    f"PROBE passive {i + 1}/2 (blocking, no write): "
+                    f"read {len(data)} bytes"
+                    + (f" | {HexFormatter(data)}" if data else "")
+                )
+
+            # Trigger test: lone 0xC0 (empty frame, no response) then blocking
+            # read. If each 0xC0 returns a chunk of stale SYNC, it is a viable
+            # flush trigger for the real fix.
+            for i in range(3):
+                self._port.write(b"\xc0")
+                data = blocking_read(0.3)
+                self.trace(
+                    f"PROBE after 0xC0 #{i + 1}/3 (blocking): "
+                    f"read {len(data)} bytes"
+                    + (f" | {HexFormatter(data)}" if data else "")
                 )
         finally:
             self._port.timeout = saved_timeout
