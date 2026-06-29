@@ -695,50 +695,60 @@ class ESPLoader:
         self._drain_sync_backlog()
 
     def _drain_sync_backlog(self):
-        """DIAGNOSTIC PROBE (not a fix): test whether a host write ("nudge")
-        flushes the device's stuck USB-Serial/JTAG TX FIFO.
+        """DIAGNOSTIC PROBE v2 (not a fix).
 
-        After sync(), a tail of SYNC replies is known to be stuck in the device
-        until the host writes again. This probe first confirms nothing arrives
-        passively, then tries different harmless writes and reports how many
-        bytes each one shakes loose, so we can pick the right flush trigger for
-        the real fix.
+        The v1 probe used non-blocking reads (timeout=0 + inWaiting()), which on
+        Windows USB-serial drivers can report 0 even when the device has data
+        ready, because bytes are only moved into the host buffer once an actual
+        blocking read (USB IN token) is issued. So v1's "0 bytes" did NOT prove
+        the link is write-gated.
+
+        v2 uses real BLOCKING reads to settle the question:
+          * If passive blocking reads (no write) return the stuck SYNC tail, the
+            link is NOT write-gated -- inWaiting just wasn't prefetching, and the
+            real fix is simply to keep reading.
+          * If passive blocking reads return nothing but a write does shake data
+            loose, the link is genuinely write-gated.
+        It also distinguishes which trigger works: a protocol-inert 0xC0 vs a
+        real command frame (READ_REG).
         """
         saved_timeout = self._port.timeout
-        self._port.timeout = 0
 
-        def snapshot(label):
-            # Give any write-triggered IN transfer time to land, then read all
-            # that is currently buffered and report it.
-            time.sleep(0.02)
-            waiting = self._port.inWaiting()
-            data = self._port.read(waiting) if waiting else b""
+        def snap(label, timeout=0.3):
+            # A real blocking USB IN request: read(1) blocks up to `timeout`,
+            # then grab whatever else arrived with it.
+            self._port.timeout = timeout
+            chunk = self._port.read(1)
+            if chunk:
+                chunk += self._port.read(self._port.inWaiting())
             self.trace(
-                f"PROBE {label}: read {len(data)} bytes"
-                + (f" | {HexFormatter(data)}" if data else "")
+                f"PROBE {label}: read {len(chunk)} bytes"
+                + (f" | {HexFormatter(chunk)}" if chunk else "")
             )
-            return len(data)
+            return len(chunk)
 
         try:
-            # 1) Passive baseline: no write at all. If the link is write-gated
-            #    these should all be 0 (the SYNC tail stays stuck).
+            # 1) DECISIVE: passive BLOCKING reads, no write at all.
+            #    data here  => NOT write-gated (v1 was a measurement artifact)
+            #    empty here => write-gated confirmed
             for i in range(3):
-                snapshot(f"passive {i + 1}/3 (no write)")
+                snap(f"passive {i + 1}/3 (blocking, no write)")
 
-            # 2) Single 0xC0 (lone SLIP delimiter / empty frame). Protocol-inert
-            #    but still a USB OUT transaction.
-            self.trace("PROBE -> writing single 0xC0 nudge")
+            # 2) Lone 0xC0 (protocol-inert), then blocking read.
+            self.trace("PROBE -> writing single 0xC0, then blocking read")
             self._port.write(b"\xc0")
-            snapshot("after single 0xC0")
-            for i in range(2):
-                snapshot(f"trailing-A {i + 1}/2 (no write)")
+            snap("after 0xC0 (blocking)")
 
-            # 3) Empty SLIP frame 0xC0 0xC0.
-            self.trace("PROBE -> writing 0xC0 0xC0 (empty frame) nudge")
-            self._port.write(b"\xc0\xc0")
-            snapshot("after 0xC0 0xC0")
-            for i in range(2):
-                snapshot(f"trailing-B {i + 1}/2 (no write)")
+            # 3) A real command frame (READ_REG of the UART date reg, harmless),
+            #    then blocking read -- this is the trigger we already know works
+            #    from the GET_SECURITY_INFO trace.
+            self.trace("PROBE -> writing real READ_REG, then blocking read")
+            pkt = struct.pack(
+                b"<BBHI", 0x00, self.ESP_CMDS["READ_REG"], 4, 0
+            ) + struct.pack("<I", self.UART_DATE_REG_ADDR)
+            self.write(pkt)
+            snap("after READ_REG (blocking)")
+            snap("trailing (blocking, no write)")
         finally:
             self._port.timeout = saved_timeout
             # Recreate the SLIP reader so it starts on a clean packet boundary.
