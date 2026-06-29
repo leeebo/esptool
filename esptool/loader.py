@@ -96,6 +96,9 @@ CHIP_ERASE_TIMEOUT = cfg.getfloat("chip_erase_timeout", 120)
 MAX_TIMEOUT = cfg.getfloat("max_timeout", CHIP_ERASE_TIMEOUT * 2)
 # Timeout for syncing with bootloader
 SYNC_TIMEOUT = cfg.getfloat("sync_timeout", 0.1)
+# Max number of SYNC flush-triggers sent to shake a stuck response out of a
+# write-gated USB-Serial/JTAG TX FIFO before giving up (see ESPLoader.command).
+MAX_FLUSH_TRIGGERS = cfg.getint("max_flush_triggers", 20)
 # Timeout (per megabyte) for calculating md5sum
 MD5_TIMEOUT_PER_MB = cfg.getfloat("md5_timeout_per_mb", 8)
 # Timeout (per megabyte) for erasing a region
@@ -159,6 +162,17 @@ def stub_and_esp32_function_only(func):
     return check_supported_function(
         func, lambda o: o.IS_STUB or o.CHIP_NAME not in ["ESP8266"]
     )
+
+
+class StuckResponseError(FatalError):
+    """The SLIP reader stopped because no more data arrived (an empty stream),
+    as opposed to a panic, invalid SLIP framing, or a half-received packet.
+
+    On a write-gated transport (e.g. some Windows USB-Serial/JTAG links) the
+    device only flushes its TX FIFO when the host writes, so a response can be
+    stuck even though the link is healthy. This narrow type lets ``command()``
+    re-trigger the flush instead of treating the stall as a fatal error.
+    """
 
 
 class StubFlasher:
@@ -503,7 +517,15 @@ class ESPLoader:
 
     def read(self):
         """Read a SLIP packet from the serial port"""
-        return next(self._slip_reader)
+        try:
+            return next(self._slip_reader)
+        except StopIteration:
+            # The generator is exhausted once it has raised (e.g. a stall). Heal
+            # it instead of leaking StopIteration up as "chip stopped responding";
+            # a fresh reader on an empty stream raises StuckResponseError, which
+            # callers can handle.
+            self._slip_reader = slip_reader(self._port, self.trace)
+            return next(self._slip_reader)
 
     def write(self, packet):
         """Write bytes to the serial port while performing SLIP escaping"""
@@ -562,12 +584,46 @@ class ESPLoader:
             if not wait_response:
                 return
 
+            # Some USB-Serial/JTAG links (seen on Windows) are "write-gated":
+            # the device only flushes its TX FIFO to the host when the host
+            # writes, so a response can sit stuck even though the link is fine.
+            # When the stream stalls (StuckResponseError) we send a harmless
+            # SYNC as a flush trigger to shake the stuck response loose. SYNC is
+            # used on purpose: its 0x08 replies never match a wanted op, so they
+            # are skipped below instead of being mistaken for the answer; and
+            # the original command is never re-sent, so this stays safe even for
+            # non-idempotent commands. Disabled once the stub is running (the
+            # stub link is not write-gated and would not expect a SYNC).
+            flush_triggers_left = (
+                MAX_FLUSH_TRIGGERS
+                if op is not None
+                and not self.IS_STUB
+                and op != self.ESP_CMDS["SYNC"]
+                else 0
+            )
+
             # tries to get a response until that response has the
             # same operation as the request or a retries limit has
             # exceeded. This is needed for some esp8266s that
             # reply with more sync responses than expected.
-            for retry in range(100):
-                p = self.read()
+            for retry in range(200):
+                try:
+                    p = self.read()
+                except StuckResponseError:
+                    if flush_triggers_left <= 0:
+                        raise
+                    flush_triggers_left -= 1
+                    # The SLIP generator is exhausted once it has raised; the
+                    # input buffer is empty at a stall, so just recreate the
+                    # reader (no flush) and nudge the device with a SYNC.
+                    self._slip_reader = slip_reader(self._port, self.trace)
+                    sync_pkt = (
+                        struct.pack(b"<BBHI", 0x00, self.ESP_CMDS["SYNC"], 36, 0)
+                        + b"\x07\x07\x12\x20"
+                        + 32 * b"\x55"
+                    )
+                    self.write(sync_pkt)
+                    continue
                 if len(p) < 8:
                     continue
                 (resp, op_ret, len_ret, val) = struct.unpack("<BBHI", p[:8])
@@ -685,68 +741,6 @@ class ESPLoader:
         for _ in range(7):
             val, _ = self.command()
             self.sync_stub_detected &= val == 0
-
-        # The ROM can emit more SYNC replies than the 8 consumed above, and on
-        # slow/buffered transports (e.g. USB-Serial/JTAG) those extras arrive
-        # late and linger in the input buffer. If left there, the next command
-        # reads a stale SYNC reply instead of its own response, putting the whole
-        # session one response behind (a desync that is unrecoverable for
-        # non-idempotent commands). Drain the backlog before any real command.
-        self._drain_sync_backlog()
-
-    def _drain_sync_backlog(self):
-        """DIAGNOSTIC PROBE v4 (not a fix): is a protocol-inert 0xC0 enough to
-        trigger the device's TX flush?
-
-        Passive waiting is already settled: the 3 s blocking "stream stopped" in
-        the GET_SECURITY_INFO trace shows even a blocking read does not pull the
-        next chunk, i.e. the link is effectively write-gated. The only thing the
-        fix still needs to know is which trigger works -- a lone 0xC0 (an empty
-        SLIP frame that the bootloader discards and never answers) or only a real
-        command frame.
-
-        0xC0 is safe on any chip precisely because it produces no response to
-        leak into the next command (unlike v2's READ_REG injection). This probe
-        first shows the baseline (no write -> nothing), then writes 0xC0 and does
-        a blocking read, repeated a few times to see if each 0xC0 shakes a chunk
-        loose.
-        """
-        saved_timeout = self._port.timeout
-
-        def blocking_read(timeout):
-            # Real blocking USB IN request: read(1) blocks up to `timeout`, then
-            # grab whatever else arrived with it.
-            self._port.timeout = timeout
-            chunk = self._port.read(1)
-            if chunk:
-                chunk += self._port.read(self._port.inWaiting())
-            return chunk
-
-        try:
-            # Baseline: no write -> expected to confirm the known write-gating.
-            for i in range(2):
-                data = blocking_read(0.2)
-                self.trace(
-                    f"PROBE passive {i + 1}/2 (blocking, no write): "
-                    f"read {len(data)} bytes"
-                    + (f" | {HexFormatter(data)}" if data else "")
-                )
-
-            # Trigger test: lone 0xC0 (empty frame, no response) then blocking
-            # read. If each 0xC0 returns a chunk of stale SYNC, it is a viable
-            # flush trigger for the real fix.
-            for i in range(3):
-                self._port.write(b"\xc0")
-                data = blocking_read(0.3)
-                self.trace(
-                    f"PROBE after 0xC0 #{i + 1}/3 (blocking): "
-                    f"read {len(data)} bytes"
-                    + (f" | {HexFormatter(data)}" if data else "")
-                )
-        finally:
-            self._port.timeout = saved_timeout
-            # Recreate the SLIP reader so it starts on a clean packet boundary.
-            self.flush_input()
 
     def get_usb_vid_pid(self):
         if self.cache["usb_vid"] is not None and self.cache["usb_pid"] is not None:
@@ -2230,6 +2224,10 @@ def slip_reader(port, trace_function):
                     if successful_slip
                     else "No serial data received."
                 )
+                # An empty stream (no half-received packet) is recoverable on a
+                # write-gated transport: command() may re-trigger the flush.
+                trace_function(msg)
+                raise StuckResponseError(msg)
             else:  # fail during packet transfer
                 msg = "Packet content transfer stopped "
                 f"(received {len(partial_packet)} bytes)."
