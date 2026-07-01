@@ -1,0 +1,376 @@
+﻿diff --git a/esptool/cmds.py b/esptool/cmds.py
+index a04a150..e2b3ab6 100644
+--- a/esptool/cmds.py
++++ b/esptool/cmds.py
+@@ -30,6 +30,7 @@ from .loader import (
+     NAND_BLOCK_SIZE,
+     NAND_PAGES_PER_BLOCK,
+     ESPLoader,
++    SKIP_FLASH_VERIFY,
+     StubFlasher,
+     timeout_per_mb,
+ )
+@@ -1570,8 +1571,12 @@ def write_flash(
+                             )
+                         raise FatalError("MD5 of file does not match data in flash!")
+                     log.print("Hash of data verified.")
+-                except NotImplementedInROMError:
+-                    pass
++                except (NotImplementedInROMError, UnsupportedCommandError):
++                    log.stage(finish=True)
++                    log.note(
++                        "ROM loader does not support SPI_FLASH_MD5; "
++                        "skipping post-flash verification."
++                    )
+             else:
+                 log.stage(finish=True)
+                 log.print(
+@@ -1718,6 +1723,13 @@ def attach_flash(
+     if flash_type == "nand":
+         return
+ 
++    if SKIP_FLASH_VERIFY:
++        log.note(
++            "skip_flash_verify is enabled: skipping XMC startup and SPI flash "
++            "connection verification."
++        )
++        return
++
+     def is_xmc_chip_strict():
+         # Read ID without cache, because it should be different after the XMC startup
+         vendor_id, device_id, _ = _get_flash_info(esp, False)
+diff --git a/esptool/config.py b/esptool/config.py
+index 6e8eca3..60027f1 100644
+--- a/esptool/config.py
++++ b/esptool/config.py
+@@ -21,6 +21,9 @@ CONFIG_OPTIONS = [
+     "connect_attempts",
+     "write_block_attempts",
+     "lost_response_resends",
++    "skip_security_info_check",
++    "skip_watchdog_disable",
++    "skip_flash_verify",
+     "reset_delay",
+     "open_port_attempts",
+     "custom_reset_sequence",
+diff --git a/esptool/loader.py b/esptool/loader.py
+index bfc8965..592c1e9 100644
+--- a/esptool/loader.py
++++ b/esptool/loader.py
+@@ -117,6 +117,12 @@ WRITE_BLOCK_ATTEMPTS = cfg.getint("write_block_attempts", 3)
+ # quick testing without any config; set "lost_response_resends = 0" in an
+ # esptool config file to restore stock upstream behavior.
+ LOST_RESPONSE_RESENDS = cfg.getint("lost_response_resends", 15)
++# Skip GET_SECURITY_INFO / chip-ID verification on connect (trust --chip).
++SKIP_SECURITY_INFO_CHECK = cfg.getint("skip_security_info_check", 0)
++# Skip disable_watchdogs() in _post_connect (for very flaky USB-JTAG links).
++SKIP_WATCHDOG_DISABLE = cfg.getint("skip_watchdog_disable", 0)
++# Skip SPI flash probe / XMC startup / connection verify on attach (flaky USB).
++SKIP_FLASH_VERIFY = cfg.getint("skip_flash_verify", 0)
+ # Number of times to try opening the serial port
+ DEFAULT_OPEN_PORT_ATTEMPTS = cfg.getint("open_port_attempts", 1)
+ 
+@@ -652,6 +658,17 @@ class ESPLoader:
+                     drain_input_buffer(0.2)
+                     raise UnsupportedCommandError(self, op)
+ 
++                # Stale reply in the RX backlog (valid packet, wrong opcode).
++                # On flaky USB-JTAG links the host can still be draining SYNC /
++                # prior command echoes when the next request is sent. Re-send
++                # immediately instead of sitting in the full command timeout.
++                if allow_resend and resends_left > 0:
++                    resends_left -= 1
++                    self.flush_input()
++                    self.write(pkt)
++                    continue
++                continue
++
+         finally:
+             if new_timeout != saved_timeout:
+                 self._port.timeout = saved_timeout
+@@ -667,6 +684,7 @@ class ESPLoader:
+         resp_data_len=0,
+         timeout=DEFAULT_TIMEOUT,
+         allow_resend=False,
++        _transport_inner=False,
+     ):
+         """
+         Execute a command with 'command', check the result code and throw an appropriate
+@@ -677,6 +695,15 @@ class ESPLoader:
+ 
+         Returns the "result" of a successful command.
+         """
++        if self._flaky_usb_transport() and not _transport_inner:
++            return self.transport_check_command(
++                op_description,
++                op,
++                data,
++                chk,
++                resp_data_len=resp_data_len,
++                timeout=timeout,
++            )
+ 
+         # The status bytes are first two bytes after the expected response data,
+         # ROM bootloaders of the chips (except ESP8266) return another 2 bytes,
+@@ -689,7 +716,7 @@ class ESPLoader:
+             data,
+             chk,
+             timeout=timeout,
+-            allow_resend=allow_resend,
++            allow_resend=allow_resend or self._flaky_usb_transport(),
+         )
+ 
+         # Check if we have enough data,
+@@ -719,10 +746,66 @@ class ESPLoader:
+         else:
+             return val
+ 
++    def transport_check_command(
++        self,
++        op_description,
++        op=None,
++        data=b"",
++        chk=0,
++        resp_data_len=0,
++        timeout=DEFAULT_TIMEOUT,
++    ):
++        """
++        ``check_command`` with extra hardening for flaky USB-JTAG transports:
++        flush stale RX data before each attempt, enable lost-response / stale-opcode
++        re-sends, and retry the whole command on transport failure.
++        """
++        for attempts_left in range(WRITE_BLOCK_ATTEMPTS - 1, -1, -1):
++            try:
++                self.flush_input()
++                return self.check_command(
++                    op_description,
++                    op,
++                    data,
++                    chk,
++                    resp_data_len=resp_data_len,
++                    timeout=timeout,
++                    allow_resend=True,
++                    _transport_inner=True,
++                )
++            except FatalError:
++                if attempts_left:
++                    self.trace(
++                        f"{op_description} failed on flaky transport, "
++                        f"retrying with {attempts_left} attempts left..."
++                    )
++                else:
++                    raise
++
+     def flush_input(self):
+         self._port.flushInput()
+         self._slip_reader = slip_reader(self._port, self.trace)
+ 
++    def _drain_stale_input(self, idle_timeout=0.05):
++        """Discard leftover SLIP packets already sitting in the RX buffer.
++
++        ROM bootloaders (especially over USB-Serial/JTAG) often echo multiple
++        SYNC replies. If those stale packets are not cleared before the next
++        command, the host can spend the full command timeout consuming wrong
++        opcodes and then fail the real request.
++        """
++        saved_timeout = self._port.timeout
++        self._port.timeout = idle_timeout
++        try:
++            while True:
++                try:
++                    next(self._slip_reader)
++                except (StopIteration, FatalError, SerialReaderStoppedError):
++                    break
++        finally:
++            self._port.timeout = saved_timeout
++        self.flush_input()
++
+     def sync(self):
+         val, _ = self.command(
+             self.ESP_CMDS["SYNC"],
+@@ -740,6 +823,9 @@ class ESPLoader:
+             val, _ = self.command()
+             self.sync_stub_detected &= val == 0
+ 
++        # USB-JTAG ROM loaders can leave many SYNC echoes in the CDC RX buffer.
++        self._drain_stale_input()
++
+     def get_usb_vid_pid(self):
+         if self.cache["usb_vid"] is not None and self.cache["usb_pid"] is not None:
+             return self.cache["usb_vid"], self.cache["usb_pid"]
+@@ -947,32 +1033,42 @@ class ESPLoader:
+         if not detecting:
+             from .targets import ROM_LIST
+ 
+-            # Check if chip supports reading chip ID from the get-security-info command
+-            try:
+-                # get_chip_id() raises FatalError if the chip does not have a chip ID
+-                # (ESP32-S2)
+-                chip_id = self.get_chip_id()
+-                si = self.get_security_info()
+-                self.secure_download_mode = si["parsed_flags"]["SECURE_DOWNLOAD_ENABLE"]
+-            except (UnsupportedCommandError, FatalError):
+-                chip_id = None
+-                # Try to read the chip magic value to verify the chip type
+-                # (ESP8266, ESP32, ESP32-S2)
++            chip_id = None
++            chip_magic_value = None
++
++            if not SKIP_SECURITY_INFO_CHECK:
++                # Check if chip supports reading chip ID from the get-security-info command
+                 try:
+-                    chip_magic_value = self.read_reg(
+-                        ESPLoader.CHIP_DETECT_MAGIC_REG_ADDR
+-                    )
+-                except UnsupportedCommandError:
+-                    # If the chip does not support reading the chip magic value,
+-                    # it is ESP32-S2 in SDM
+-                    chip_magic_value = None
+-                    self.secure_download_mode = True
++                    # get_chip_id() raises FatalError if the chip does not have a chip ID
++                    # (ESP32-S2)
++                    chip_id = self.get_chip_id()
++                    si = self.get_security_info()
++                    self.secure_download_mode = si["parsed_flags"][
++                        "SECURE_DOWNLOAD_ENABLE"
++                    ]
++                except (UnsupportedCommandError, FatalError):
++                    chip_id = None
++                    # Try to read the chip magic value to verify the chip type
++                    # (ESP8266, ESP32, ESP32-S2)
++                    try:
++                        chip_magic_value = self.read_reg(
++                            ESPLoader.CHIP_DETECT_MAGIC_REG_ADDR
++                        )
++                    except UnsupportedCommandError:
++                        # If the chip does not support reading the chip magic value,
++                        # it is ESP32-S2 in SDM
++                        chip_magic_value = None
++                        self.secure_download_mode = True
++            else:
++                self._drain_stale_input()
+ 
+             detected = None
+             chip_arg_wrong = False
+ 
++            if SKIP_SECURITY_INFO_CHECK:
++                pass
+             # If we can read chip ID (ESP32-S3 and later), verify the ID
+-            if chip_id and (self.USES_MAGIC_VALUE or chip_id != self.IMAGE_CHIP_ID):
++            elif chip_id and (self.USES_MAGIC_VALUE or chip_id != self.IMAGE_CHIP_ID):
+                 chip_arg_wrong = True
+                 for cls in ROM_LIST:
+                     if not cls.USES_MAGIC_VALUE and chip_id == cls.IMAGE_CHIP_ID:
+@@ -1028,6 +1124,10 @@ class ESPLoader:
+         """
+         pass
+ 
++    def _flaky_usb_transport(self):
++        """True when this link is configured for USB-JTAG transport hardening."""
++        return LOST_RESPONSE_RESENDS > 0 and self.uses_usb_jtag_serial()
++
+     def read_reg(self, addr, timeout=DEFAULT_TIMEOUT):
+         """Read memory address in target"""
+         command = struct.pack("<I", addr)
+@@ -1043,7 +1143,15 @@ class ESPLoader:
+             allow_resend=True,
+         )
+ 
+-    def write_reg(self, addr, value, mask=0xFFFFFFFF, delay_us=0, delay_after_us=0):
++    def write_reg(
++        self,
++        addr,
++        value,
++        mask=0xFFFFFFFF,
++        delay_us=0,
++        delay_after_us=0,
++        allow_resend=False,
++    ):
+         """Write to memory address in target"""
+         command = struct.pack("<IIII", addr, value, mask, delay_us)
+         if delay_after_us > 0:
+@@ -1053,7 +1161,10 @@ class ESPLoader:
+             )
+ 
+         return self.check_command(
+-            "write target memory", self.ESP_CMDS["WRITE_REG"], command
++            "write target memory",
++            self.ESP_CMDS["WRITE_REG"],
++            command,
++            allow_resend=allow_resend,
+         )
+ 
+     def update_reg(self, addr, mask, new_val):
+@@ -1170,12 +1281,14 @@ class ESPLoader:
+         operation = "encrypted " if encrypted else ""
+         for attempts_left in range(WRITE_BLOCK_ATTEMPTS - 1, -1, -1):
+             try:
++                self.flush_input()
+                 self.check_command(
+                     f"write {operation}to target flash after seq {seq}",
+                     self.ESP_CMDS["FLASH_DATA"],
+                     struct.pack("<IIII", len(data), seq, 0, 0) + data,
+                     self.checksum(data),
+                     timeout=timeout,
++                    allow_resend=True,
+                 )
+                 break
+             except FatalError:
+@@ -1791,7 +1904,9 @@ class ESPLoader:
+             # (as it's not usually needed.)
+             is_legacy = 0
+             arg += struct.pack("BBBB", is_legacy, 0, 0, 0)
+-        self.check_command("configure SPI flash pins", self.ESP_CMDS["SPI_ATTACH"], arg)
++        self.check_command(
++            "configure SPI flash pins", self.ESP_CMDS["SPI_ATTACH"], arg
++        )
+ 
+     def flash_spi_nand_attach(self, hspi_arg):
+         """Send SPI NAND attach command to enable the SPI NAND flash pins
+diff --git a/esptool/targets/esp32c3.py b/esptool/targets/esp32c3.py
+index ff78984..8277a3b 100644
+--- a/esptool/targets/esp32c3.py
++++ b/esptool/targets/esp32c3.py
+@@ -222,20 +222,30 @@ class ESP32C3ROM(ESP32ROM):
+     def disable_watchdogs(self):
+         # When USB-JTAG/Serial is used, the RTC WDT and SWD watchdog are not reset
+         # and can then reset the board during flashing. Disable or autofeed them.
+-        if self.uses_usb_jtag_serial():
+-            # Disable RTC WDT
+-            self.write_reg(self.RTC_CNTL_WDTWPROTECT_REG, self.RTC_CNTL_WDT_WKEY)
+-            self.write_reg(self.RTC_CNTL_WDTCONFIG0_REG, 0)
+-            self.write_reg(self.RTC_CNTL_WDTWPROTECT_REG, 0)
+-
+-            # Automatically feed SWD
+-            self.write_reg(self.RTC_CNTL_SWD_WPROTECT_REG, self.RTC_CNTL_SWD_WKEY)
++        from .. import loader as _loader
++
++        if _loader.SKIP_WATCHDOG_DISABLE or not self.uses_usb_jtag_serial():
++            return
++
++        def wreg_flush(addr, value, mask=0xFFFFFFFF, delay_us=0, delay_after_us=0):
++            self.flush_input()
+             self.write_reg(
+-                self.RTC_CNTL_SWD_CONF_REG,
+-                self.read_reg(self.RTC_CNTL_SWD_CONF_REG)
+-                | self.RTC_CNTL_SWD_AUTO_FEED_EN,
++                addr, value, mask, delay_us, delay_after_us, allow_resend=True
+             )
+-            self.write_reg(self.RTC_CNTL_SWD_WPROTECT_REG, 0)
++
++        # Disable RTC WDT
++        wreg_flush(self.RTC_CNTL_WDTWPROTECT_REG, self.RTC_CNTL_WDT_WKEY)
++        wreg_flush(self.RTC_CNTL_WDTCONFIG0_REG, 0)
++        wreg_flush(self.RTC_CNTL_WDTWPROTECT_REG, 0)
++
++        # Automatically feed SWD
++        wreg_flush(self.RTC_CNTL_SWD_WPROTECT_REG, self.RTC_CNTL_SWD_WKEY)
++        self.flush_input()
++        swd_conf = (
++            self.read_reg(self.RTC_CNTL_SWD_CONF_REG) | self.RTC_CNTL_SWD_AUTO_FEED_EN
++        )
++        wreg_flush(self.RTC_CNTL_SWD_CONF_REG, swd_conf)
++        wreg_flush(self.RTC_CNTL_SWD_WPROTECT_REG, 0)
+ 
+     def _post_connect(self):
+         if not self.sync_stub_detected:  # Don't run if stub is reused
