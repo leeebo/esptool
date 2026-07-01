@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2014-2025 Fredrik Ahlberg, Angus Gratton,
+﻿# SPDX-FileCopyrightText: 2014-2025 Fredrik Ahlberg, Angus Gratton,
 # Espressif Systems (Shanghai) CO LTD, other contributors as noted.
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
@@ -264,6 +264,17 @@ class NANDEraseFailed(FatalError):
 
     def __init__(self, message):
         FatalError.__init__(self, message)
+
+
+class SerialReaderStoppedError(FatalError):
+    """
+    Raised when the SLIP reader stops because the serial stream ended before a
+    response was received (empty read), as opposed to a panic, invalid SLIP
+    framing, or a partially-transferred packet. This narrow type lets callers
+    optionally re-send idempotent requests on flaky transports (e.g.
+    USB-Serial/JTAG links with marginal signal integrity) without swallowing
+    genuine errors. See the ``lost_response_resends`` configuration option.
+    """
 
 
 class UnsupportedCommandError(RuntimeError):
