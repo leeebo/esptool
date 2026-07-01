@@ -310,20 +310,30 @@ class ESP32S3ROM(ESP32ROM):
     def disable_watchdogs(self):
         # When USB-JTAG/Serial is used, the RTC WDT and SWD watchdog are not reset
         # and can then reset the board during flashing. Disable them.
-        if self.uses_usb_jtag_serial():
-            # Disable RTC WDT
-            self.write_reg(self.RTC_CNTL_WDTWPROTECT_REG, self.RTC_CNTL_WDT_WKEY)
-            self.write_reg(self.RTC_CNTL_WDTCONFIG0_REG, 0)
-            self.write_reg(self.RTC_CNTL_WDTWPROTECT_REG, 0)
+        from .. import loader as _loader
 
-            # Automatically feed SWD
-            self.write_reg(self.RTC_CNTL_SWD_WPROTECT_REG, self.RTC_CNTL_SWD_WKEY)
+        if _loader.SKIP_WATCHDOG_DISABLE or not self.uses_usb_jtag_serial():
+            return
+
+        def wreg_flush(addr, value, mask=0xFFFFFFFF, delay_us=0, delay_after_us=0):
+            self.flush_input()
             self.write_reg(
-                self.RTC_CNTL_SWD_CONF_REG,
-                self.read_reg(self.RTC_CNTL_SWD_CONF_REG)
-                | self.RTC_CNTL_SWD_AUTO_FEED_EN,
+                addr, value, mask, delay_us, delay_after_us, allow_resend=True
             )
-            self.write_reg(self.RTC_CNTL_SWD_WPROTECT_REG, 0)
+
+        # Disable RTC WDT
+        wreg_flush(self.RTC_CNTL_WDTWPROTECT_REG, self.RTC_CNTL_WDT_WKEY)
+        wreg_flush(self.RTC_CNTL_WDTCONFIG0_REG, 0)
+        wreg_flush(self.RTC_CNTL_WDTWPROTECT_REG, 0)
+
+        # Automatically feed SWD
+        wreg_flush(self.RTC_CNTL_SWD_WPROTECT_REG, self.RTC_CNTL_SWD_WKEY)
+        self.flush_input()
+        swd_conf = (
+            self.read_reg(self.RTC_CNTL_SWD_CONF_REG) | self.RTC_CNTL_SWD_AUTO_FEED_EN
+        )
+        wreg_flush(self.RTC_CNTL_SWD_CONF_REG, swd_conf)
+        wreg_flush(self.RTC_CNTL_SWD_WPROTECT_REG, 0)
 
     def _post_connect(self):
         if self.uses_usb_otg():

@@ -30,6 +30,7 @@ from .loader import (
     NAND_BLOCK_SIZE,
     NAND_PAGES_PER_BLOCK,
     ESPLoader,
+    SKIP_FLASH_VERIFY,
     StubFlasher,
     timeout_per_mb,
 )
@@ -1570,8 +1571,12 @@ def write_flash(
                             )
                         raise FatalError("MD5 of file does not match data in flash!")
                     log.print("Hash of data verified.")
-                except NotImplementedInROMError:
-                    pass
+                except (NotImplementedInROMError, UnsupportedCommandError):
+                    log.stage(finish=True)
+                    log.note(
+                        "ROM loader does not support SPI_FLASH_MD5; "
+                        "skipping post-flash verification."
+                    )
             else:
                 log.stage(finish=True)
                 log.print(
@@ -1716,6 +1721,13 @@ def attach_flash(
 
     # Skip XMC chip detection and flash size detection for NAND
     if flash_type == "nand":
+        return
+
+    if SKIP_FLASH_VERIFY:
+        log.note(
+            "skip_flash_verify is enabled: skipping XMC startup and SPI flash "
+            "connection verification."
+        )
         return
 
     def is_xmc_chip_strict():

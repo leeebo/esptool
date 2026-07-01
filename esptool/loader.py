@@ -30,6 +30,7 @@ from .util import (
     NANDProgramFailed,
     NotImplementedInROMError,
     NotSupportedError,
+    SerialReaderStoppedError,
     UnsupportedCommandError,
     byte,
     get_key_from_value,
@@ -110,6 +111,18 @@ DEFAULT_SERIAL_WRITE_TIMEOUT = cfg.getfloat("serial_write_timeout", 10)
 DEFAULT_CONNECT_ATTEMPTS = cfg.getint("connect_attempts", 7)
 # Number of times to try writing a data block
 WRITE_BLOCK_ATTEMPTS = cfg.getint("write_block_attempts", 3)
+# Number of times to re-send an idempotent request whose response is lost on a
+# flaky transport (e.g. USB-Serial/JTAG on boards with marginal USB signal
+# integrity). This fork ships with it ON (15) so it can be sent to users for
+# quick testing without any config; set "lost_response_resends = 0" in an
+# esptool config file to restore stock upstream behavior.
+LOST_RESPONSE_RESENDS = cfg.getint("lost_response_resends", 15)
+# Skip GET_SECURITY_INFO / chip-ID verification on connect (trust --chip).
+SKIP_SECURITY_INFO_CHECK = cfg.getint("skip_security_info_check", 0)
+# Skip disable_watchdogs() in _post_connect (for very flaky USB-JTAG links).
+SKIP_WATCHDOG_DISABLE = cfg.getint("skip_watchdog_disable", 0)
+# Skip SPI flash probe / XMC startup / connection verify on attach (flaky USB).
+SKIP_FLASH_VERIFY = cfg.getint("skip_flash_verify", 0)
 # Number of times to try opening the serial port
 DEFAULT_OPEN_PORT_ATTEMPTS = cfg.getint("open_port_attempts", 1)
 
@@ -503,7 +516,16 @@ class ESPLoader:
 
     def read(self):
         """Read a SLIP packet from the serial port"""
-        return next(self._slip_reader)
+        try:
+            return next(self._slip_reader)
+        except StopIteration:
+            # The SLIP generator can be exhausted after a transport error.
+            # Convert this into the narrow transport error instead of leaking
+            # StopIteration from internal state.
+            raise SerialReaderStoppedError(
+                "Serial reader stopped unexpectedly: "
+                "Possible serial noise or corruption."
+            )
 
     def write(self, packet):
         """Write bytes to the serial port while performing SLIP escaping"""
@@ -541,8 +563,19 @@ class ESPLoader:
         chk=0,
         wait_response=True,
         timeout=DEFAULT_TIMEOUT,
+        allow_resend=False,
     ):
-        """Send a request and read the response"""
+        """Send a request and read the response.
+
+        ``allow_resend`` drives the ``lost_response_resends`` workaround for
+        flaky transports (e.g. USB-Serial/JTAG with marginal signal integrity):
+        re-send the request if the response is lost (the SLIP stream stops). It
+        is disabled by default and bounded by the ``lost_response_resends``
+        config option. Safe for any idempotent request and never masks a
+        genuine error: a real ``UnsupportedCommandError`` (ROM "invalid
+        command" reply), a panic, or an invalid/partial packet is always raised
+        immediately, and non-idempotent commands simply leave it off.
+        """
         saved_timeout = self._port.timeout
         new_timeout = min(timeout, MAX_TIMEOUT)
         if new_timeout != saved_timeout:
@@ -566,8 +599,24 @@ class ESPLoader:
             # same operation as the request or a retries limit has
             # exceeded. This is needed for some esp8266s that
             # reply with more sync responses than expected.
+            resends_left = LOST_RESPONSE_RESENDS if allow_resend else 0
             for retry in range(100):
-                p = self.read()
+                try:
+                    p = self.read()
+                except SerialReaderStoppedError:
+                    # The response was lost before it arrived (empty serial
+                    # stream). For opted-in idempotent requests on a flaky
+                    # transport this is recoverable: re-send and keep waiting.
+                    # flush_input() also recreates the SLIP reader, which is
+                    # exhausted once it has raised. Panic / invalid-SLIP /
+                    # partial-packet errors raise plain FatalError and are not
+                    # caught here, so they are never masked.
+                    if op is None or not allow_resend or resends_left <= 0:
+                        raise
+                    resends_left -= 1
+                    self.flush_input()
+                    self.write(pkt)
+                    continue
                 if len(p) < 8:
                     continue
                 (resp, op_ret, len_ret, val) = struct.unpack("<BBHI", p[:8])
@@ -609,6 +658,17 @@ class ESPLoader:
                     drain_input_buffer(0.2)
                     raise UnsupportedCommandError(self, op)
 
+                # Stale reply in the RX backlog (valid packet, wrong opcode).
+                # On flaky USB-JTAG links the host can still be draining SYNC /
+                # prior command echoes when the next request is sent. Re-send
+                # immediately instead of sitting in the full command timeout.
+                if allow_resend and resends_left > 0:
+                    resends_left -= 1
+                    self.flush_input()
+                    self.write(pkt)
+                    continue
+                continue
+
         finally:
             if new_timeout != saved_timeout:
                 self._port.timeout = saved_timeout
@@ -623,13 +683,27 @@ class ESPLoader:
         chk=0,
         resp_data_len=0,
         timeout=DEFAULT_TIMEOUT,
+        allow_resend=False,
+        _transport_inner=False,
     ):
         """
         Execute a command with 'command', check the result code and throw an appropriate
         FatalError if it fails.
 
+        ``allow_resend`` is forwarded to ``command()``; only set it for
+        idempotent commands (see ``command()``).
+
         Returns the "result" of a successful command.
         """
+        if self._flaky_usb_transport() and not _transport_inner:
+            return self.transport_check_command(
+                op_description,
+                op,
+                data,
+                chk,
+                resp_data_len=resp_data_len,
+                timeout=timeout,
+            )
 
         # The status bytes are first two bytes after the expected response data,
         # ROM bootloaders of the chips (except ESP8266) return another 2 bytes,
@@ -637,7 +711,13 @@ class ESPLoader:
         STATUS_BYTES_LENGTH = 2
 
         # Execute the command and get the result
-        val, data = self.command(op, data, chk, timeout=timeout)
+        val, data = self.command(
+            op,
+            data,
+            chk,
+            timeout=timeout,
+            allow_resend=allow_resend or self._flaky_usb_transport(),
+        )
 
         # Check if we have enough data,
         # including the expected response data and status bytes
@@ -666,15 +746,72 @@ class ESPLoader:
         else:
             return val
 
+    def transport_check_command(
+        self,
+        op_description,
+        op=None,
+        data=b"",
+        chk=0,
+        resp_data_len=0,
+        timeout=DEFAULT_TIMEOUT,
+    ):
+        """
+        ``check_command`` with extra hardening for flaky USB-JTAG transports:
+        flush stale RX data before each attempt, enable lost-response / stale-opcode
+        re-sends, and retry the whole command on transport failure.
+        """
+        for attempts_left in range(WRITE_BLOCK_ATTEMPTS - 1, -1, -1):
+            try:
+                self.flush_input()
+                return self.check_command(
+                    op_description,
+                    op,
+                    data,
+                    chk,
+                    resp_data_len=resp_data_len,
+                    timeout=timeout,
+                    allow_resend=True,
+                    _transport_inner=True,
+                )
+            except FatalError:
+                if attempts_left:
+                    self.trace(
+                        f"{op_description} failed on flaky transport, "
+                        f"retrying with {attempts_left} attempts left..."
+                    )
+                else:
+                    raise
+
     def flush_input(self):
         self._port.flushInput()
         self._slip_reader = slip_reader(self._port, self.trace)
+
+    def _drain_stale_input(self, idle_timeout=0.05):
+        """Discard leftover SLIP packets already sitting in the RX buffer.
+
+        ROM bootloaders (especially over USB-Serial/JTAG) often echo multiple
+        SYNC replies. If those stale packets are not cleared before the next
+        command, the host can spend the full command timeout consuming wrong
+        opcodes and then fail the real request.
+        """
+        saved_timeout = self._port.timeout
+        self._port.timeout = idle_timeout
+        try:
+            while True:
+                try:
+                    next(self._slip_reader)
+                except (StopIteration, FatalError, SerialReaderStoppedError):
+                    break
+        finally:
+            self._port.timeout = saved_timeout
+        self.flush_input()
 
     def sync(self):
         val, _ = self.command(
             self.ESP_CMDS["SYNC"],
             b"\x07\x07\x12\x20" + 32 * b"\x55",
             timeout=SYNC_TIMEOUT,
+            allow_resend=True,  # SYNC is idempotent
         )
 
         # ROM bootloaders send some non-zero "val" response. The flasher stub sends 0.
@@ -686,63 +823,8 @@ class ESPLoader:
             val, _ = self.command()
             self.sync_stub_detected &= val == 0
 
-        # The ROM can emit more SYNC replies than the 8 consumed above, and on
-        # slow/buffered transports (e.g. USB-Serial/JTAG) those extras arrive
-        # late and linger in the input buffer. If left there, the next command
-        # reads a stale SYNC reply instead of its own response, putting the whole
-        # session one response behind (a desync that is unrecoverable for
-        # non-idempotent commands). Drain the backlog before any real command.
-        self._drain_sync_backlog()
-
-    def _drain_sync_backlog(self):
-        """DIAGNOSTIC PROBE (not a fix): test whether a host write ("nudge")
-        flushes the device's stuck USB-Serial/JTAG TX FIFO.
-
-        After sync(), a tail of SYNC replies is known to be stuck in the device
-        until the host writes again. This probe first confirms nothing arrives
-        passively, then tries different harmless writes and reports how many
-        bytes each one shakes loose, so we can pick the right flush trigger for
-        the real fix.
-        """
-        saved_timeout = self._port.timeout
-        self._port.timeout = 0
-
-        def snapshot(label):
-            # Give any write-triggered IN transfer time to land, then read all
-            # that is currently buffered and report it.
-            time.sleep(0.02)
-            waiting = self._port.inWaiting()
-            data = self._port.read(waiting) if waiting else b""
-            self.trace(
-                f"PROBE {label}: read {len(data)} bytes"
-                + (f" | {HexFormatter(data)}" if data else "")
-            )
-            return len(data)
-
-        try:
-            # 1) Passive baseline: no write at all. If the link is write-gated
-            #    these should all be 0 (the SYNC tail stays stuck).
-            for i in range(3):
-                snapshot(f"passive {i + 1}/3 (no write)")
-
-            # 2) Single 0xC0 (lone SLIP delimiter / empty frame). Protocol-inert
-            #    but still a USB OUT transaction.
-            self.trace("PROBE -> writing single 0xC0 nudge")
-            self._port.write(b"\xc0")
-            snapshot("after single 0xC0")
-            for i in range(2):
-                snapshot(f"trailing-A {i + 1}/2 (no write)")
-
-            # 3) Empty SLIP frame 0xC0 0xC0.
-            self.trace("PROBE -> writing 0xC0 0xC0 (empty frame) nudge")
-            self._port.write(b"\xc0\xc0")
-            snapshot("after 0xC0 0xC0")
-            for i in range(2):
-                snapshot(f"trailing-B {i + 1}/2 (no write)")
-        finally:
-            self._port.timeout = saved_timeout
-            # Recreate the SLIP reader so it starts on a clean packet boundary.
-            self.flush_input()
+        # USB-JTAG ROM loaders can leave many SYNC echoes in the CDC RX buffer.
+        self._drain_stale_input()
 
     def get_usb_vid_pid(self):
         if self.cache["usb_vid"] is not None and self.cache["usb_pid"] is not None:
@@ -951,32 +1033,42 @@ class ESPLoader:
         if not detecting:
             from .targets import ROM_LIST
 
-            # Check if chip supports reading chip ID from the get-security-info command
-            try:
-                # get_chip_id() raises FatalError if the chip does not have a chip ID
-                # (ESP32-S2)
-                chip_id = self.get_chip_id()
-                si = self.get_security_info()
-                self.secure_download_mode = si["parsed_flags"]["SECURE_DOWNLOAD_ENABLE"]
-            except (UnsupportedCommandError, FatalError):
-                chip_id = None
-                # Try to read the chip magic value to verify the chip type
-                # (ESP8266, ESP32, ESP32-S2)
+            chip_id = None
+            chip_magic_value = None
+
+            if not SKIP_SECURITY_INFO_CHECK:
+                # Check if chip supports reading chip ID from the get-security-info command
                 try:
-                    chip_magic_value = self.read_reg(
-                        ESPLoader.CHIP_DETECT_MAGIC_REG_ADDR
-                    )
-                except UnsupportedCommandError:
-                    # If the chip does not support reading the chip magic value,
-                    # it is ESP32-S2 in SDM
-                    chip_magic_value = None
-                    self.secure_download_mode = True
+                    # get_chip_id() raises FatalError if the chip does not have a chip ID
+                    # (ESP32-S2)
+                    chip_id = self.get_chip_id()
+                    si = self.get_security_info()
+                    self.secure_download_mode = si["parsed_flags"][
+                        "SECURE_DOWNLOAD_ENABLE"
+                    ]
+                except (UnsupportedCommandError, FatalError):
+                    chip_id = None
+                    # Try to read the chip magic value to verify the chip type
+                    # (ESP8266, ESP32, ESP32-S2)
+                    try:
+                        chip_magic_value = self.read_reg(
+                            ESPLoader.CHIP_DETECT_MAGIC_REG_ADDR
+                        )
+                    except UnsupportedCommandError:
+                        # If the chip does not support reading the chip magic value,
+                        # it is ESP32-S2 in SDM
+                        chip_magic_value = None
+                        self.secure_download_mode = True
+            else:
+                self._drain_stale_input()
 
             detected = None
             chip_arg_wrong = False
 
+            if SKIP_SECURITY_INFO_CHECK:
+                pass
             # If we can read chip ID (ESP32-S3 and later), verify the ID
-            if chip_id and (self.USES_MAGIC_VALUE or chip_id != self.IMAGE_CHIP_ID):
+            elif chip_id and (self.USES_MAGIC_VALUE or chip_id != self.IMAGE_CHIP_ID):
                 chip_arg_wrong = True
                 for cls in ROM_LIST:
                     if not cls.USES_MAGIC_VALUE and chip_id == cls.IMAGE_CHIP_ID:
@@ -1032,14 +1124,34 @@ class ESPLoader:
         """
         pass
 
+    def _flaky_usb_transport(self):
+        """True when this link is configured for USB-JTAG transport hardening."""
+        return LOST_RESPONSE_RESENDS > 0 and self.uses_usb_jtag_serial()
+
     def read_reg(self, addr, timeout=DEFAULT_TIMEOUT):
         """Read memory address in target"""
         command = struct.pack("<I", addr)
         return self.check_command(
-            "read target memory", self.ESP_CMDS["READ_REG"], command, timeout=timeout
+            "read target memory",
+            self.ESP_CMDS["READ_REG"],
+            command,
+            timeout=timeout,
+            # Reading a register is idempotent, so re-sending on a lost response
+            # is safe. But READ_REG is disabled in Secure Download Mode and its
+            # "invalid command" reply is used to detect ESP32-S2 SDM (see
+            # detect_chip), so we must NOT re-send on invalid command here.
+            allow_resend=True,
         )
 
-    def write_reg(self, addr, value, mask=0xFFFFFFFF, delay_us=0, delay_after_us=0):
+    def write_reg(
+        self,
+        addr,
+        value,
+        mask=0xFFFFFFFF,
+        delay_us=0,
+        delay_after_us=0,
+        allow_resend=False,
+    ):
         """Write to memory address in target"""
         command = struct.pack("<IIII", addr, value, mask, delay_us)
         if delay_after_us > 0:
@@ -1049,7 +1161,10 @@ class ESPLoader:
             )
 
         return self.check_command(
-            "write target memory", self.ESP_CMDS["WRITE_REG"], command
+            "write target memory",
+            self.ESP_CMDS["WRITE_REG"],
+            command,
+            allow_resend=allow_resend,
         )
 
     def update_reg(self, addr, mask, new_val):
@@ -1166,12 +1281,14 @@ class ESPLoader:
         operation = "encrypted " if encrypted else ""
         for attempts_left in range(WRITE_BLOCK_ATTEMPTS - 1, -1, -1):
             try:
+                self.flush_input()
                 self.check_command(
                     f"write {operation}to target flash after seq {seq}",
                     self.ESP_CMDS["FLASH_DATA"],
                     struct.pack("<IIII", len(data), seq, 0, 0) + data,
                     self.checksum(data),
                     timeout=timeout,
+                    allow_resend=True,
                 )
                 break
             except FatalError:
@@ -1261,15 +1378,29 @@ class ESPLoader:
                 self.ESP_CMDS["GET_SECURITY_INFO"],
                 b"",
                 resp_data_len=20,
+                # Idempotent, but GET_SECURITY_INFO is a feature probe (absent on
+                # ESP8266/ESP32, restricted differently in SDM), so only re-send
+                # on a lost response, never on a real "invalid command" reply.
+                allow_resend=True,
             )
             res = struct.unpack("<IBBBBBBBBII", res)
             esp32s2 = False
+        except SerialReaderStoppedError:
+            # A genuine transport failure (the response was lost even after any
+            # opted-in re-sends). Do not mask it as the ESP32-S2 short-response
+            # fallback below; surface the link failure to the caller.
+            raise
         except FatalError:
+            # A short/!=20-byte response is the expected ESP32-S2 case.
+            # The first failed read may exhaust the current SLIP reader.
+            # Reset parser state before retrying with the shorter response.
+            self.flush_input()
             res = self.check_command(
                 "get security info",
                 self.ESP_CMDS["GET_SECURITY_INFO"],
                 b"",
                 resp_data_len=12,
+                allow_resend=True,  # lost-response only; see the 20-byte call
             )
             res = struct.unpack("<IBBBBBBBB", res)
             esp32s2 = True
@@ -1445,7 +1576,7 @@ class ESPLoader:
 
         try:
             p = self.read()
-        except StopIteration:
+        except SerialReaderStoppedError:
             raise FatalError(
                 "Failed to start stub flasher. There was no response."
                 "\nTry increasing timeouts, for more information see: "
@@ -1565,6 +1696,9 @@ class ESPLoader:
             struct.pack("<IIII", addr, size, 0, 0),
             resp_data_len=RESP_DATA_LEN_STUB if self.IS_STUB else RESP_DATA_LEN,
             timeout=timeout,
+            # Computing an MD5 over a flash region is idempotent, so re-sending
+            # on a lost response is safe.
+            allow_resend=True,
         )
 
         if not self.IS_STUB:
@@ -1770,7 +1904,9 @@ class ESPLoader:
             # (as it's not usually needed.)
             is_legacy = 0
             arg += struct.pack("BBBB", is_legacy, 0, 0, 0)
-        self.check_command("configure SPI flash pins", self.ESP_CMDS["SPI_ATTACH"], arg)
+        self.check_command(
+            "configure SPI flash pins", self.ESP_CMDS["SPI_ATTACH"], arg
+        )
 
     def flash_spi_nand_attach(self, hspi_arg):
         """Send SPI NAND attach command to enable the SPI NAND flash pins
@@ -2226,6 +2362,11 @@ def slip_reader(port, trace_function):
                     if successful_slip
                     else "No serial data received."
                 )
+                # Narrow type so callers may optionally re-send idempotent
+                # requests on a flaky transport. Panic, invalid SLIP framing,
+                # and partial-packet transfers keep raising plain FatalError.
+                trace_function(msg)
+                raise SerialReaderStoppedError(msg)
             else:  # fail during packet transfer
                 msg = "Packet content transfer stopped "
                 f"(received {len(partial_packet)} bytes)."
